@@ -71,13 +71,20 @@ def verify_pw(pw: str, hashed: str) -> bool:
 
 
 async def seed_admin() -> None:
+    # Sempre sincroniza usuário/senha do admin com as variáveis de ambiente,
+    # para que trocar ADMIN_USERNAME/ADMIN_PASSWORD no host tenha efeito em
+    # cada deploy (antes só criava na primeira vez e nunca mais atualizava).
     await db.users.update_one(
-        {"username_lower": ADMIN_USERNAME.lower()},
-        {"$setOnInsert": {
-            "id": str(uuid.uuid4()), "username": ADMIN_USERNAME, "username_lower": ADMIN_USERNAME.lower(),
-            "password_hash": hash_pw(ADMIN_PASSWORD), "role": "admin", "name": "Mestre Muringá",
-            "student_id": None, "created_at": now_iso(),
-        }},
+        {"role": "admin"},
+        {
+            "$set": {
+                "username": ADMIN_USERNAME, "username_lower": ADMIN_USERNAME.lower(),
+                "password_hash": hash_pw(ADMIN_PASSWORD), "name": "Mestre Muringá",
+            },
+            "$setOnInsert": {
+                "id": str(uuid.uuid4()), "student_id": None, "created_at": now_iso(),
+            },
+        },
         upsert=True,
     )
 

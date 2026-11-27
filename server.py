@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import uuid
+from calendar import monthrange
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,22 +43,32 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("id", ASCENDING)], name="id", unique=True),
         IndexModel([("full_name", ASCENDING)], name="full_name"),
         IndexModel([("professor_id", ASCENDING)], name="professor_id"),
+        IndexModel([("turma_id", ASCENDING)], name="turma_id"),
+    ],
+    # Turmas (grupos por bairro) de cada professor.
+    "turmas": [
+        IndexModel([("id", ASCENDING)], name="id", unique=True),
+        IndexModel([("professor_id", ASCENDING)], name="professor_id"),
     ],
     "attendance": [
         IndexModel([("date", ASCENDING), ("student_id", ASCENDING)], name="date_student", unique=True),
     ],
-    # Agenda de treino é por professor/cidade: cada professor tem seus 7 dias.
-    "schedule": [IndexModel([("professor_id", ASCENDING), ("weekday", ASCENDING)], name="prof_weekday", unique=True)],
+    # Agenda de treino é por TURMA: cada turma tem seus 7 dias.
+    "schedule": [
+        IndexModel([("turma_id", ASCENDING), ("weekday", ASCENDING)], name="turma_weekday", unique=True),
+        IndexModel([("professor_id", ASCENDING)], name="professor_id"),
+    ],
     "messages": [
         IndexModel([("created_at", DESCENDING)], name="created_desc"),
         IndexModel([("professor_id", ASCENDING)], name="professor_id"),
     ],
 }
 
-# Índices antigos que precisam ser removidos ao migrar para o modelo multi-cidade.
+# Índices antigos que precisam ser removidos ao migrar de modelo.
 OBSOLETE_INDEXES: dict[str, list[str]] = {
-    # schedule era global (único por weekday); agora é por (professor_id, weekday).
-    "schedule": ["weekday"],
+    # schedule era global (único por weekday) e depois por (professor_id, weekday);
+    # agora é por (turma_id, weekday).
+    "schedule": ["weekday", "prof_weekday"],
 }
 
 
@@ -72,6 +83,37 @@ async def ensure_indexes() -> None:
                 await db[collection].create_indexes([model])
             except Exception as exc:
                 logger.error("ensure_indexes(%s.%s): %s", collection, model.document["name"], exc)
+
+
+async def migrate_turmas() -> None:
+    """Migra dados antigos (sem turma) para o modelo com turmas.
+
+    Antes, alunos e a agenda pertenciam diretamente ao professor. Agora cada
+    aluno pertence a uma turma e a agenda é por turma. Para cada professor que
+    ainda tenha alunos/agenda sem ``turma_id``, cria uma "Turma principal" e
+    vincula esses registros a ela. Idempotente: depois da 1ª execução não
+    sobram registros com ``turma_id`` nulo, então o laço não faz mais nada."""
+    # O índice único da agenda mudou; derruba os antigos antes de reatribuir.
+    for name in ("weekday", "prof_weekday"):
+        with suppress(Exception):
+            await db.schedule.drop_index(name)
+
+    legacy_student_pids = await db.students.distinct("professor_id", {"turma_id": None})
+    legacy_sched_pids = await db.schedule.distinct("professor_id", {"turma_id": None})
+    pids = {p for p in [*legacy_student_pids, *legacy_sched_pids] if p}
+    for pid in pids:
+        existing = await db.turmas.find_one({"professor_id": pid}, {"_id": 0, "id": 1})
+        if existing:
+            turma_id = existing["id"]
+        else:
+            prof = await db.users.find_one({"id": pid}, {"_id": 0, "city": 1})
+            turma_id = str(uuid.uuid4())
+            await db.turmas.insert_one({
+                "id": turma_id, "professor_id": pid, "name": "Turma principal",
+                "bairro": (prof or {}).get("city", "") or "", "local": "", "created_at": now_iso(),
+            })
+        await db.students.update_many({"professor_id": pid, "turma_id": None}, {"$set": {"turma_id": turma_id}})
+        await db.schedule.update_many({"professor_id": pid, "turma_id": None}, {"$set": {"turma_id": turma_id}})
 
 
 def now_iso() -> str:
@@ -135,8 +177,15 @@ class ProfessorIn(BaseModel):
     password: Optional[str] = Field(default=None, min_length=4, max_length=100)
 
 
+class TurmaIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    bairro: str = Field(default="", max_length=120)
+    local: str = Field(default="", max_length=200)
+
+
 class StudentIn(BaseModel):
     full_name: str = Field(min_length=2, max_length=120)
+    turma_id: str = Field(min_length=1)
     birth_date: str = ""
     phone: str = ""
     mother_name: str = ""
@@ -158,6 +207,7 @@ class AttendanceIn(BaseModel):
 
 
 class ScheduleIn(BaseModel):
+    turma_id: str = Field(min_length=1)
     active: bool
     start: str = Field(default="", pattern=r"^(([01]\d|2[0-3]):[0-5]\d)?$")
     end: str = Field(default="", pattern=r"^(([01]\d|2[0-3]):[0-5]\d)?$")
@@ -226,6 +276,22 @@ async def owned_student(student_id: str, user: dict) -> dict:
     if not st or st.get("professor_id") != user["id"]:
         raise HTTPException(status_code=404, detail="Aluno não encontrado.")
     return st
+
+
+async def owned_turma(turma_id: str, user: dict) -> dict:
+    """Garante que a turma pertence ao professor logado."""
+    t = await db.turmas.find_one({"id": turma_id}, {"_id": 0})
+    if not t or t.get("professor_id") != user["id"]:
+        raise HTTPException(status_code=404, detail="Turma não encontrada.")
+    return t
+
+
+async def student_turma_id(user: dict) -> Optional[str]:
+    """ID da turma do aluno logado (None para outros papéis)."""
+    if user["role"] != "student":
+        return None
+    st = await db.students.find_one({"id": user.get("student_id")}, {"_id": 0, "turma_id": 1})
+    return (st or {}).get("turma_id")
 
 
 @api.post("/auth/login")
@@ -300,6 +366,7 @@ async def delete_professor(pid: str, _: dict = Depends(admin_only)):
     if sids:
         await db.attendance.delete_many({"student_id": {"$in": sids}})
     await db.students.delete_many({"professor_id": pid})
+    await db.turmas.delete_many({"professor_id": pid})
     await db.schedule.delete_many({"professor_id": pid})
     await db.messages.delete_many({"professor_id": pid})
     # Remove as contas de aluno desse professor e, por fim, o próprio professor.
@@ -308,9 +375,63 @@ async def delete_professor(pid: str, _: dict = Depends(admin_only)):
     return {"ok": True}
 
 
+# ---------- Turmas (grupos por bairro) ----------
+def public_turma(t: dict) -> dict:
+    return {"id": t["id"], "name": t.get("name", ""), "bairro": t.get("bairro", ""),
+            "local": t.get("local", "")}
+
+
+@api.get("/turmas")
+async def list_turmas(user: dict = Depends(professor_only)):
+    turmas = await db.turmas.find({"professor_id": user["id"]}, {"_id": 0}).sort("name", 1).to_list(1000)
+    out = []
+    for t in turmas:
+        count = await db.students.count_documents({"turma_id": t["id"]})
+        out.append({**public_turma(t), "students": count})
+    return out
+
+
+@api.get("/my/turma")
+async def my_turma(user: dict = Depends(current_user)):
+    """Turma do aluno logado (para mostrar local, bairro e dias na tela dele)."""
+    tid = await student_turma_id(user)
+    if not tid:
+        return None
+    t = await db.turmas.find_one({"id": tid}, {"_id": 0})
+    return public_turma(t) if t else None
+
+
+@api.post("/turmas")
+async def create_turma(data: TurmaIn, user: dict = Depends(professor_only)):
+    doc = {"id": str(uuid.uuid4()), "professor_id": user["id"], "name": data.name.strip(),
+           "bairro": data.bairro.strip(), "local": data.local.strip(), "created_at": now_iso()}
+    await db.turmas.insert_one(doc)
+    return {**public_turma(doc), "students": 0}
+
+
+@api.put("/turmas/{turma_id}")
+async def update_turma(turma_id: str, data: TurmaIn, user: dict = Depends(professor_only)):
+    await owned_turma(turma_id, user)
+    await db.turmas.update_one({"id": turma_id}, {"$set": {
+        "name": data.name.strip(), "bairro": data.bairro.strip(), "local": data.local.strip()}})
+    t = await db.turmas.find_one({"id": turma_id}, {"_id": 0})
+    count = await db.students.count_documents({"turma_id": turma_id})
+    return {**public_turma(t), "students": count}
+
+
+@api.delete("/turmas/{turma_id}")
+async def delete_turma(turma_id: str, user: dict = Depends(professor_only)):
+    await owned_turma(turma_id, user)
+    if await db.students.count_documents({"turma_id": turma_id}) > 0:
+        raise HTTPException(status_code=409, detail="Mova ou exclua os alunos desta turma antes de removê-la.")
+    await db.schedule.delete_many({"turma_id": turma_id})
+    await db.turmas.delete_one({"id": turma_id})
+    return {"ok": True}
+
+
 # ---------- Students ----------
 @api.get("/students")
-async def list_students(user: dict = Depends(current_user)):
+async def list_students(turma_id: Optional[str] = None, user: dict = Depends(current_user)):
     role = user["role"]
     if role == "admin":
         docs = await db.students.find({}, {"_id": 0}).sort("full_name", 1).to_list(5000)
@@ -318,20 +439,36 @@ async def list_students(user: dict = Depends(current_user)):
         by_student = {a["student_id"]: a["username"] for a in accounts}
         profs = {p["id"]: p for p in await db.users.find(
             {"role": "professor"}, {"_id": 0, "id": 1, "name": 1, "city": 1}).to_list(1000)}
+        turmas = {t["id"]: t for t in await db.turmas.find(
+            {}, {"_id": 0, "id": 1, "name": 1, "bairro": 1}).to_list(5000)}
         for d in docs:
             d["username"] = by_student.get(d["id"])
             prof = profs.get(d.get("professor_id"), {})
             d["professor_name"] = prof.get("name", "")
+            turma = turmas.get(d.get("turma_id"), {})
+            d["turma_name"] = turma.get("name", "")
+            d["bairro"] = turma.get("bairro", "")
         return docs
-    pid = scope_pid(user)
-    docs = await db.students.find({"professor_id": pid}, {"_id": 0}).sort("full_name", 1).to_list(5000)
     if role == "student":
+        tid = await student_turma_id(user)
+        docs = await db.students.find({"turma_id": tid}, {"_id": 0}).sort("full_name", 1).to_list(5000)
         return [{"id": d["id"], "full_name": d["full_name"]} for d in docs]
+    # Professor: filtra à sua cidade e, opcionalmente, a uma turma.
+    pid = user["id"]
+    q: dict = {"professor_id": pid}
+    if turma_id:
+        q["turma_id"] = turma_id
+    docs = await db.students.find(q, {"_id": 0}).sort("full_name", 1).to_list(5000)
     accounts = await db.users.find(
         {"role": "student", "professor_id": pid}, {"_id": 0, "student_id": 1, "username": 1}).to_list(5000)
     by_student = {a["student_id"]: a["username"] for a in accounts}
+    turmas = {t["id"]: t for t in await db.turmas.find(
+        {"professor_id": pid}, {"_id": 0, "id": 1, "name": 1, "bairro": 1}).to_list(1000)}
     for d in docs:
         d["username"] = by_student.get(d["id"])
+        turma = turmas.get(d.get("turma_id"), {})
+        d["turma_name"] = turma.get("name", "")
+        d["bairro"] = turma.get("bairro", "")
     return docs
 
 
@@ -344,6 +481,7 @@ def clean_name(name: str) -> str:
 
 @api.post("/students")
 async def create_student(data: StudentIn, user: dict = Depends(professor_only)):
+    await owned_turma(data.turma_id, user)
     doc = {"id": str(uuid.uuid4()), **data.model_dump(),
            "professor_id": user["id"], "city": user.get("city", ""), "created_at": now_iso()}
     doc["full_name"] = clean_name(doc["full_name"])
@@ -355,6 +493,7 @@ async def create_student(data: StudentIn, user: dict = Depends(professor_only)):
 @api.put("/students/{student_id}")
 async def update_student(student_id: str, data: StudentIn, user: dict = Depends(professor_only)):
     await owned_student(student_id, user)
+    await owned_turma(data.turma_id, user)
     upd = data.model_dump()
     upd["full_name"] = clean_name(upd["full_name"])
     await db.students.update_one({"id": student_id}, {"$set": upd})
@@ -405,18 +544,24 @@ async def remove_access(student_id: str, user: dict = Depends(professor_only)):
 
 
 # ---------- Attendance ----------
-async def scope_student_ids(user: dict) -> list[str]:
-    pid = scope_pid(user)
-    docs = await db.students.find({"professor_id": pid}, {"_id": 0, "id": 1}).to_list(5000)
+async def scope_student_ids(user: dict, turma_id: Optional[str] = None) -> list[str]:
+    if user["role"] == "student":
+        q: dict = {"turma_id": await student_turma_id(user)}
+    else:
+        q = {"professor_id": user["id"]}
+        if turma_id:
+            q["turma_id"] = turma_id
+    docs = await db.students.find(q, {"_id": 0, "id": 1}).to_list(5000)
     return [d["id"] for d in docs]
 
 
 @api.get("/attendance")
-async def get_attendance(date: str = Query(pattern=DATE_RE), user: dict = Depends(current_user)):
+async def get_attendance(date: str = Query(pattern=DATE_RE), turma_id: Optional[str] = None,
+                         user: dict = Depends(current_user)):
     if user["role"] == "admin":
         docs = await db.attendance.find({"date": date}, {"_id": 0}).to_list(5000)
     else:
-        sids = await scope_student_ids(user)
+        sids = await scope_student_ids(user, turma_id)
         docs = await db.attendance.find(
             {"date": date, "student_id": {"$in": sids}}, {"_id": 0}).to_list(5000)
     return {"date": date, "records": {d["student_id"]: d["status"] for d in docs}}
@@ -424,13 +569,14 @@ async def get_attendance(date: str = Query(pattern=DATE_RE), user: dict = Depend
 
 @api.put("/attendance")
 async def set_attendance(data: AttendanceIn, user: dict = Depends(professor_only)):
-    await owned_student(data.student_id, user)
+    st = await owned_student(data.student_id, user)
     if data.status == "none":
         await db.attendance.delete_one({"date": data.date, "student_id": data.student_id})
     else:
         await db.attendance.update_one(
             {"date": data.date, "student_id": data.student_id},
-            {"$set": {"status": data.status, "professor_id": user["id"], "updated_at": now_iso()}},
+            {"$set": {"status": data.status, "professor_id": user["id"],
+                      "turma_id": st.get("turma_id"), "updated_at": now_iso()}},
             upsert=True)
     return {"ok": True}
 
@@ -465,12 +611,24 @@ async def report(month: str = Query(pattern=r"^\d{4}-\d{2}$"),
 
 
 # ---------- Schedule ----------
+def default_week() -> list[dict]:
+    return [{"weekday": i, "active": False, "start": "", "end": ""} for i in range(7)]
+
+
 @api.get("/schedule")
-async def get_schedule(user: dict = Depends(current_user)):
-    pid = scope_pid(user)
-    if pid is None:
-        return [{"weekday": i, "active": False, "start": "", "end": ""} for i in range(7)]
-    docs = {d["weekday"]: d for d in await db.schedule.find({"professor_id": pid}, {"_id": 0}).to_list(7)}
+async def get_schedule(turma_id: Optional[str] = None, user: dict = Depends(current_user)):
+    role = user["role"]
+    if role == "student":
+        tid = await student_turma_id(user)
+    elif role == "professor":
+        if turma_id:
+            await owned_turma(turma_id, user)
+        tid = turma_id
+    else:
+        tid = None
+    if not tid:
+        return default_week()
+    docs = {d["weekday"]: d for d in await db.schedule.find({"turma_id": tid}, {"_id": 0}).to_list(7)}
     return [docs.get(i, {"weekday": i, "active": False, "start": "", "end": ""}) for i in range(7)]
 
 
@@ -478,11 +636,78 @@ async def get_schedule(user: dict = Depends(current_user)):
 async def set_schedule(weekday: int, data: ScheduleIn, user: dict = Depends(professor_only)):
     if weekday < 0 or weekday > 6:
         raise HTTPException(status_code=422, detail="Dia inválido.")
+    await owned_turma(data.turma_id, user)
     if data.active and (not data.start or not data.end):
         raise HTTPException(status_code=422, detail="Informe o horário de início e fim.")
-    doc = {"professor_id": user["id"], "weekday": weekday, **data.model_dump()}
-    await db.schedule.update_one({"professor_id": user["id"], "weekday": weekday}, {"$set": doc}, upsert=True)
-    return doc
+    doc = {"turma_id": data.turma_id, "professor_id": user["id"], "weekday": weekday,
+           "active": data.active, "start": data.start, "end": data.end}
+    await db.schedule.update_one({"turma_id": data.turma_id, "weekday": weekday}, {"$set": doc}, upsert=True)
+    return {"weekday": weekday, "active": data.active, "start": data.start, "end": data.end}
+
+
+# ---------- Aniversários ----------
+BR_TZ = timezone(timedelta(hours=-3))  # Brasil (sem horário de verão)
+
+
+def parse_birth(bd: str):
+    """'DD/MM/AAAA' (ano opcional) -> (dia, mês, ano|None) ou None se inválido."""
+    if not bd:
+        return None
+    parts = bd.strip().split("/")
+    try:
+        day, month = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return None
+    year = None
+    if len(parts) >= 3 and parts[2]:
+        with suppress(ValueError):
+            y = int(parts[2])
+            if 1900 <= y <= 2100:
+                year = y
+    return day, month, year
+
+
+def next_birthday(day: int, month: int, today):
+    def safe(year: int):
+        last = monthrange(year, month)[1]
+        return datetime(year, month, min(day, last)).date()
+    occ = safe(today.year)
+    if occ < today:
+        occ = safe(today.year + 1)
+    return occ
+
+
+@api.get("/birthdays")
+async def birthdays(user: dict = Depends(current_user)):
+    role = user["role"]
+    if role == "admin":
+        q: dict = {}
+    elif role == "professor":
+        q = {"professor_id": user["id"]}
+    else:
+        q = {"turma_id": await student_turma_id(user)}
+    students = await db.students.find(
+        q, {"_id": 0, "id": 1, "full_name": 1, "birth_date": 1, "turma_id": 1}).to_list(5000)
+    turmas = {t["id"]: t.get("name", "")
+              for t in await db.turmas.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(5000)}
+    today = datetime.now(BR_TZ).date()
+    out = []
+    for s in students:
+        parsed = parse_birth(s.get("birth_date", ""))
+        if not parsed:
+            continue
+        day, month, year = parsed
+        occ = next_birthday(day, month, today)
+        du = (occ - today).days
+        out.append({
+            "student_id": s["id"], "name": s["full_name"], "birth_date": s.get("birth_date", ""),
+            "day": day, "month": month, "age": (occ.year - year) if year is not None else None,
+            "is_today": du == 0, "days_until": du, "turma_name": turmas.get(s.get("turma_id"), ""),
+        })
+    out.sort(key=lambda x: x["days_until"])
+    return {"today": [x for x in out if x["is_today"]], "list": out}
 
 
 # ---------- Messages ----------
@@ -526,6 +751,7 @@ app.add_middleware(CORSMiddleware, allow_credentials=False, allow_origins=["*"],
 @app.on_event("startup")
 async def startup():
     await seed_admin()
+    await migrate_turmas()
     app.state.index_task = asyncio.create_task(ensure_indexes())
 
 

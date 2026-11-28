@@ -611,6 +611,24 @@ async def report(month: str = Query(pattern=r"^\d{4}-\d{2}$"),
     return {"month": month, "class_days": len(dates), "students": list(stats.values())}
 
 
+@api.get("/attendance/my-history")
+async def my_attendance_history(user: dict = Depends(current_user)):
+    """Histórico completo de presenças/faltas do próprio aluno logado.
+
+    Lista todos os dias registrados (mais recentes primeiro) e os totais.
+    Escopo sempre ao próprio aluno — nunca expõe dados de colegas."""
+    sid = user.get("student_id")
+    if user["role"] != "student" or not sid:
+        return {"present": 0, "absent": 0, "total": 0, "days": []}
+    docs = await db.attendance.find(
+        {"student_id": sid, "status": {"$in": ["present", "absent"]}},
+        {"_id": 0, "date": 1, "status": 1}).to_list(50000)
+    docs.sort(key=lambda d: d["date"], reverse=True)
+    present = sum(1 for d in docs if d["status"] == "present")
+    absent = sum(1 for d in docs if d["status"] == "absent")
+    return {"present": present, "absent": absent, "total": present + absent, "days": docs}
+
+
 # ---------- Schedule ----------
 def default_week() -> list[dict]:
     return [{"weekday": i, "active": False, "start": "", "end": ""} for i in range(7)]

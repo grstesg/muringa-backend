@@ -450,9 +450,9 @@ async def list_students(turma_id: Optional[str] = None, user: dict = Depends(cur
             d["bairro"] = turma.get("bairro", "")
         return docs
     if role == "student":
-        tid = await student_turma_id(user)
-        docs = await db.students.find({"turma_id": tid}, {"_id": 0}).sort("full_name", 1).to_list(5000)
-        return [{"id": d["id"], "full_name": d["full_name"]} for d in docs]
+        # O aluno só enxerga o próprio cadastro, nunca os colegas da turma.
+        doc = await db.students.find_one({"id": user.get("student_id")}, {"_id": 0})
+        return [{"id": doc["id"], "full_name": doc["full_name"]}] if doc else []
     # Professor: filtra à sua cidade e, opcionalmente, a uma turma.
     pid = user["id"]
     q: dict = {"professor_id": pid}
@@ -546,11 +546,12 @@ async def remove_access(student_id: str, user: dict = Depends(professor_only)):
 # ---------- Attendance ----------
 async def scope_student_ids(user: dict, turma_id: Optional[str] = None) -> list[str]:
     if user["role"] == "student":
-        q: dict = {"turma_id": await student_turma_id(user)}
-    else:
-        q = {"professor_id": user["id"]}
-        if turma_id:
-            q["turma_id"] = turma_id
+        # O aluno só vê a própria presença, não a dos colegas.
+        sid = user.get("student_id")
+        return [sid] if sid else []
+    q = {"professor_id": user["id"]}
+    if turma_id:
+        q["turma_id"] = turma_id
     docs = await db.students.find(q, {"_id": 0, "id": 1}).to_list(5000)
     return [d["id"] for d in docs]
 
